@@ -4,9 +4,23 @@ const PREVIEW_ROWS = 8;
 const SAMPLE_SCAN_LIMIT = 10;
 const DEMO_RECORDS = 500;
 const QR_CACHE_MAX = 2000;
+const STORAGE_DATA_KEY = 'whscan.data.v1';
+const STORAGE_VIEW_KEY = 'whscan.view.v1';
 const COLORS = { transit:'#448aff', delivered:'#00e676', pending:'#f5a623', hold:'#ff1744', unknown:'#4a6275' };
 const STATUS_LABEL = { transit:'In Transit', delivered:'Delivered', pending:'Pending', hold:'On Hold', unknown:'Unknown' };
 const SEARCH_FIELDS = ['tracking', 'item', 'sku', 'dest', 'carrier', 'category', 'priority'];
+const FIELD_FILTER_LABELS = {
+  item: 'Item',
+  dest: 'Location',
+  sku: 'SKU',
+  category: 'Category',
+  qty: 'Quantity',
+  carrier: 'Carrier',
+  priority: 'Priority',
+  weight: 'Weight',
+  date: 'Date',
+  tracking: 'Tracking',
+};
 
 // field definitions: id, sampleId, autoHints
 const FIELD_DEFS = [
@@ -33,6 +47,8 @@ let activeFilter = 'all';
 let searchVal = '';
 let loadedWorkbook = null;
 let qrObserver = null;
+let selectedFieldFilterKey = '';
+let selectedFieldFilterValue = '';
 const pendingQRRenders = new Map();
 const qrCache = new Map();
 
@@ -92,6 +108,66 @@ function showSheetPicker(sheetNames) {
   picker.style.display = 'block';
 }
 
+function currentStep() {
+  const active = document.querySelector('.step-panel.active');
+  if (!active) return 1;
+  const id = active.id || '';
+  if (id.endsWith('1')) return 1;
+  if (id.endsWith('2')) return 2;
+  if (id.endsWith('3')) return 3;
+  return 1;
+}
+
+function getMapperSelections() {
+  const mappings = {};
+  FIELD_DEFS.forEach(f => {
+    const el = document.getElementById(f.id);
+    mappings[f.id] = el ? el.value : '';
+  });
+  return mappings;
+}
+
+function persistData() {
+  try {
+    const payload = {
+      parsedRows,
+      fileHeaders,
+      allRecords,
+      mappings: getMapperSelections(),
+    };
+    localStorage.setItem(STORAGE_DATA_KEY, JSON.stringify(payload));
+  } catch (err) {
+    console.warn('Failed to persist data state:', err);
+  }
+}
+
+function persistView() {
+  try {
+    const payload = {
+      step: currentStep(),
+      activeFilter,
+      searchVal,
+      currentPage,
+      selectedFieldFilterKey,
+      selectedFieldFilterValue,
+      mappings: getMapperSelections(),
+    };
+    localStorage.setItem(STORAGE_VIEW_KEY, JSON.stringify(payload));
+  } catch (err) {
+    console.warn('Failed to persist view state:', err);
+  }
+}
+
+function readJsonStorage(key) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 function goStep(n) {
   document.querySelectorAll('.step-panel').forEach((p, i) => {
     const isActive = i + 1 === n;
@@ -114,6 +190,7 @@ function goStep(n) {
       focusTarget.focus();
     }
   }
+  persistView();
 }
 
 function parseWorksheet(wb, sheetName) {
@@ -121,10 +198,16 @@ function parseWorksheet(wb, sheetName) {
   parsedRows = XLSX.utils.sheet_to_json(ws, { defval: '' });
   if (!parsedRows.length) throw new Error(`No data rows found in "${sheetName}".`);
   fileHeaders = Object.keys(parsedRows[0]);
+  allRecords = [];
+  filtered = [];
+  currentPage = 1;
+  activeFilter = 'all';
+  searchVal = '';
   hideSheetPicker();
   showUploadStatus(`✓ ${parsedRows.length} rows loaded from "${sheetName}"`);
   populateMapper();
   goStep(2);
+  persistData();
 }
 
 function handleFile(file) {
@@ -153,7 +236,7 @@ function handleFile(file) {
   reader.readAsArrayBuffer(file);
 }
 
-function populateMapper() {
+function populateMapper(preferredMappings = null) {
   FIELD_DEFS.forEach(f => {
     const sel = document.getElementById(f.id);
     sel.innerHTML = '';
@@ -167,13 +250,20 @@ function populateMapper() {
       opt.textContent = h;
       sel.appendChild(opt);
     });
-    const match = fileHeaders.find(h => f.hints.some(k => h.toLowerCase().includes(k)));
-    if (match) sel.value = match;
+    const preferred = preferredMappings && preferredMappings[f.id];
+    const hasPreferred = preferred && fileHeaders.includes(preferred);
+    if (hasPreferred) {
+      sel.value = preferred;
+    } else {
+      const match = fileHeaders.find(h => f.hints.some(k => h.toLowerCase().includes(k)));
+      if (match) sel.value = match;
+    }
     updateSample(f);
-    sel.onchange = () => { updateSample(f); renderPreviewTable(); };
+    sel.onchange = () => { updateSample(f); renderPreviewTable(); persistView(); persistData(); };
   });
   document.getElementById('preview-total').textContent = parsedRows.length + ' rows total';
   renderPreviewTable();
+  persistView();
 }
 
 function updateSample(f) {
@@ -247,6 +337,66 @@ function getMappedValue(id, row) {
   const col = gv(id);
   if (!col) return null;
   return asText(row[col]);
+}
+
+function getAvailableFieldFilterKeys() {
+  return Object.keys(FIELD_FILTER_LABELS).filter(key => allRecords.some(r => hasValue(r[key]) && r[key] !== '—'));
+}
+
+function getFieldFilterValues(key) {
+  if (!key) return [];
+  const values = new Set();
+  allRecords.forEach(r => {
+    if (hasValue(r[key]) && r[key] !== '—') values.add(String(r[key]));
+  });
+  return Array.from(values).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+}
+
+function refreshFieldFilterControls() {
+  const fieldSel = document.getElementById('field-filter-key');
+  const valueSel = document.getElementById('field-filter-value');
+  if (!fieldSel || !valueSel) return;
+
+  const availableKeys = getAvailableFieldFilterKeys();
+  const keepKey = availableKeys.includes(selectedFieldFilterKey);
+  if (!keepKey) {
+    selectedFieldFilterKey = '';
+    selectedFieldFilterValue = '';
+  }
+
+  fieldSel.innerHTML = '<option value="">Field Filter: None</option>';
+  availableKeys.forEach(key => {
+    const opt = document.createElement('option');
+    opt.value = key;
+    opt.textContent = FIELD_FILTER_LABELS[key] || key;
+    fieldSel.appendChild(opt);
+  });
+  fieldSel.value = selectedFieldFilterKey;
+
+  valueSel.innerHTML = '';
+  if (!selectedFieldFilterKey) {
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'Value: All';
+    valueSel.appendChild(opt);
+    valueSel.disabled = true;
+    return;
+  }
+
+  const values = getFieldFilterValues(selectedFieldFilterKey);
+  const allOpt = document.createElement('option');
+  allOpt.value = '';
+  allOpt.textContent = 'Value: All';
+  valueSel.appendChild(allOpt);
+  values.forEach(v => {
+    const opt = document.createElement('option');
+    opt.value = v;
+    opt.textContent = v;
+    valueSel.appendChild(opt);
+  });
+  if (!values.includes(selectedFieldFilterValue)) selectedFieldFilterValue = '';
+  valueSel.value = selectedFieldFilterValue;
+  valueSel.disabled = false;
 }
 
 function buildRecords() {
@@ -335,12 +485,15 @@ function setQrCache(tracking, markup) {
   }
 }
 
-function launch(records) {
+function launch(records, options = {}) {
+  const view = options.view || null;
   allRecords = records;
   filtered = [...records];
-  currentPage = 1;
-  activeFilter = 'all';
-  searchVal = '';
+  currentPage = view && Number.isInteger(view.currentPage) ? Math.max(1, view.currentPage) : 1;
+  activeFilter = view && typeof view.activeFilter === 'string' ? view.activeFilter : 'all';
+  searchVal = view && typeof view.searchVal === 'string' ? view.searchVal : '';
+  selectedFieldFilterKey = view && typeof view.selectedFieldFilterKey === 'string' ? view.selectedFieldFilterKey : '';
+  selectedFieldFilterValue = view && typeof view.selectedFieldFilterValue === 'string' ? view.selectedFieldFilterValue : '';
 
   const s3 = document.getElementById('step-3');
   s3.innerHTML = `
@@ -357,6 +510,10 @@ function launch(records) {
         <button class="filter-btn f-pending" data-filter="pending">Pending</button>
         <button class="filter-btn f-hold" data-filter="hold">Hold</button>
       </div>
+      <div class="field-filter-wrap">
+        <select class="search-input field-filter-select" id="field-filter-key" aria-label="Choose field filter"></select>
+        <select class="search-input field-filter-select" id="field-filter-value" aria-label="Choose field value"></select>
+      </div>
       <div class="results-count">Showing <span id="rec-count">0</span> records</div>
       <button class="btn-remap" id="btn-remap">⚙ Remap</button>
     </div>
@@ -367,11 +524,34 @@ function launch(records) {
   buildStats();
   goStep(3);
 
-  document.getElementById('search').addEventListener('input', e => {
+  const searchInput = document.getElementById('search');
+  const filtersContainer = document.getElementById('filters');
+  const fieldFilterKeySel = document.getElementById('field-filter-key');
+  const fieldFilterValueSel = document.getElementById('field-filter-value');
+  searchInput.value = searchVal;
+  refreshFieldFilterControls();
+  document.querySelectorAll('.filter-btn').forEach(x => x.classList.remove('active'));
+  const activeBtn = filtersContainer.querySelector(`[data-filter="${activeFilter}"]`) || filtersContainer.querySelector('[data-filter="all"]');
+  if (activeBtn) {
+    activeBtn.classList.add('active');
+    activeFilter = activeBtn.dataset.filter;
+  }
+
+  searchInput.addEventListener('input', e => {
     searchVal = e.target.value;
     applyFilters();
   });
-  document.getElementById('filters').addEventListener('click', e => {
+  fieldFilterKeySel.addEventListener('change', e => {
+    selectedFieldFilterKey = e.target.value;
+    selectedFieldFilterValue = '';
+    refreshFieldFilterControls();
+    applyFilters();
+  });
+  fieldFilterValueSel.addEventListener('change', e => {
+    selectedFieldFilterValue = e.target.value;
+    applyFilters();
+  });
+  filtersContainer.addEventListener('click', e => {
     const b = e.target.closest('.filter-btn');
     if (!b) return;
     document.querySelectorAll('.filter-btn').forEach(x => x.classList.remove('active'));
@@ -382,6 +562,14 @@ function launch(records) {
   document.getElementById('btn-remap')?.addEventListener('click', () => goStep(2));
 
   applyFilters();
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const restorePage = Math.min(currentPage, totalPages);
+  if (restorePage > 1) {
+    currentPage = restorePage;
+    renderPage();
+  }
+  if (options.persist !== false) persistData();
+  persistView();
 }
 
 function buildStats() {
@@ -411,10 +599,14 @@ function applyFilters() {
   filtered = allRecords.filter(r => {
     const matchesStatus = activeFilter === 'all' || r.status === activeFilter;
     const matchesQuery = !q || SEARCH_FIELDS.some(k => hasValue(r[k]) && String(r[k]).toLowerCase().includes(q));
-    return matchesStatus && matchesQuery;
+    const matchesField = !selectedFieldFilterKey
+      || !selectedFieldFilterValue
+      || String(r[selectedFieldFilterKey] ?? '') === selectedFieldFilterValue;
+    return matchesStatus && matchesQuery && matchesField;
   });
   currentPage = 1;
   renderPage();
+  persistView();
 }
 
 function renderPage() {
@@ -510,7 +702,7 @@ function renderPagination() {
     const b = document.createElement('button');
     b.className = 'page-btn ' + cls;
     b.textContent = label;
-    if (page !== null) b.onclick = () => { currentPage = page; renderPage(); };
+    if (page !== null) b.onclick = () => { currentPage = page; renderPage(); persistView(); };
     return b;
   };
 
@@ -609,4 +801,19 @@ const missing = checkDependencies();
 if (missing.length) {
   setControlsDisabled(true);
   showUploadStatus(`✗ Missing dependencies: ${missing.join(', ')}. This page requires CDN access for full functionality.`, true);
+} else {
+  const savedData = readJsonStorage(STORAGE_DATA_KEY);
+  const savedView = readJsonStorage(STORAGE_VIEW_KEY);
+  if (savedData && Array.isArray(savedData.parsedRows) && Array.isArray(savedData.fileHeaders)) {
+    parsedRows = savedData.parsedRows;
+    fileHeaders = savedData.fileHeaders;
+    if (parsedRows.length && fileHeaders.length) {
+      populateMapper(savedView && savedView.mappings ? savedView.mappings : savedData.mappings);
+      if (savedView && savedView.step === 3 && Array.isArray(savedData.allRecords) && savedData.allRecords.length) {
+        launch(savedData.allRecords, { view: savedView, persist: false });
+      } else if (savedView && savedView.step === 2) {
+        goStep(2);
+      }
+    }
+  }
 }
