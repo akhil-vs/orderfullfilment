@@ -49,6 +49,7 @@ let loadedWorkbook = null;
 let qrObserver = null;
 let selectedFieldFilterKey = '';
 let selectedFieldFilterValue = '';
+let qrFieldSelection = 'tracking';
 const pendingQRRenders = new Map();
 const qrCache = new Map();
 
@@ -237,8 +238,10 @@ function handleFile(file) {
 }
 
 function populateMapper(preferredMappings = null) {
-  FIELD_DEFS.forEach(f => {
-    const sel = document.getElementById(f.id);
+  // Only map tracking field
+  const f = FIELD_DEFS[0]; // tracking field
+  const sel = document.getElementById(f.id);
+  if (sel) {
     sel.innerHTML = '';
     const none = document.createElement('option');
     none.value = '';
@@ -260,7 +263,7 @@ function populateMapper(preferredMappings = null) {
     }
     updateSample(f);
     sel.onchange = () => { updateSample(f); renderPreviewTable(); persistView(); persistData(); };
-  });
+  }
   document.getElementById('preview-total').textContent = parsedRows.length + ' rows total';
   renderPreviewTable();
   persistView();
@@ -281,7 +284,8 @@ function updateSample(f) {
 }
 
 function getMappedCols() {
-  return FIELD_DEFS.map(f => document.getElementById(f.id).value).filter(Boolean);
+  const trackingField = document.getElementById('m-tracking');
+  return trackingField ? [trackingField.value].filter(Boolean) : [];
 }
 
 function renderPreviewTable() {
@@ -406,19 +410,18 @@ function buildRecords() {
   return parsedRows
     .filter(r => hasValue(r[tCol]))
     .map(row => {
-      const extra = {};
-      ['category', 'sku', 'qty', 'carrier', 'priority'].forEach(k => {
-        const col = gv('m-' + k);
-        if (col) extra[k] = asText(row[col]);
-      });
       return {
         tracking: String(row[tCol]).trim(),
-        item: getMappedValue('m-item', row),
-        dest: getMappedValue('m-dest', row),
-        status: gv('m-status') ? normalizeStatus(row[gv('m-status')]) : 'unknown',
-        weight: getMappedValue('m-weight', row),
-        date: getMappedValue('m-date', row),
-        ...extra,
+        item: '—',
+        dest: '—',
+        status: 'unknown',
+        weight: '—',
+        date: '—',
+        category: '—',
+        sku: '—',
+        qty: '—',
+        carrier: '—',
+        priority: '—',
         idx: idx++,
       };
     });
@@ -497,22 +500,17 @@ function launch(records, options = {}) {
 
   const s3 = document.getElementById('step-3');
   s3.innerHTML = `
-    <div class="stats-row" id="stats-row"></div>
     <div class="controls" id="controls">
       <div class="search-wrap">
         <span class="search-icon">⌕</span>
         <input class="search-input" id="search" placeholder="Search tracking, item, SKU, location…" autocomplete="off" aria-label="Search records"/>
       </div>
-      <div class="filter-group" id="filters">
-        <button class="filter-btn active" data-filter="all">All</button>
-        <button class="filter-btn f-transit" data-filter="transit">Transit</button>
-        <button class="filter-btn f-delivered" data-filter="delivered">Delivered</button>
-        <button class="filter-btn f-pending" data-filter="pending">Pending</button>
-        <button class="filter-btn f-hold" data-filter="hold">Hold</button>
+      <div class="field-filter-wrap">
+        <select class="search-input field-filter-select" id="qr-field-select" aria-label="Choose QR field"></select>
       </div>
       <div class="field-filter-wrap">
-        <select class="search-input field-filter-select" id="field-filter-key" aria-label="Choose field filter"></select>
-        <select class="search-input field-filter-select" id="field-filter-value" aria-label="Choose field value"></select>
+        <select class="search-input field-filter-select" id="data-field-filter-key" aria-label="Choose data filter field"></select>
+        <select class="search-input field-filter-select" id="data-field-filter-value" aria-label="Choose data filter value"></select>
       </div>
       <div class="results-count">Showing <span id="rec-count">0</span> records</div>
       <button class="btn-remap" id="btn-remap">⚙ Remap</button>
@@ -521,42 +519,56 @@ function launch(records, options = {}) {
     <div class="pagination" id="pagination"></div>
   `;
 
-  buildStats();
   goStep(3);
 
   const searchInput = document.getElementById('search');
-  const filtersContainer = document.getElementById('filters');
-  const fieldFilterKeySel = document.getElementById('field-filter-key');
-  const fieldFilterValueSel = document.getElementById('field-filter-value');
+  const qrFieldSelect = document.getElementById('qr-field-select');
+  const dataFieldFilterKey = document.getElementById('data-field-filter-key');
+  const dataFieldFilterValue = document.getElementById('data-field-filter-value');
   searchInput.value = searchVal;
-  refreshFieldFilterControls();
-  document.querySelectorAll('.filter-btn').forEach(x => x.classList.remove('active'));
-  const activeBtn = filtersContainer.querySelector(`[data-filter="${activeFilter}"]`) || filtersContainer.querySelector('[data-filter="all"]');
-  if (activeBtn) {
-    activeBtn.classList.add('active');
-    activeFilter = activeBtn.dataset.filter;
-  }
+
+  // Populate QR field selector
+  qrFieldSelect.innerHTML = '';
+  const qrFieldOptions = ['tracking', 'item', 'sku', 'dest', 'category', 'carrier', 'priority'];
+  qrFieldOptions.forEach(fieldKey => {
+    const opt = document.createElement('option');
+    opt.value = fieldKey;
+    opt.textContent = FIELD_FILTER_LABELS[fieldKey] || fieldKey;
+    qrFieldSelect.appendChild(opt);
+  });
+  qrFieldSelect.value = qrFieldSelection;
+
+  // Populate data field filter key selector
+  dataFieldFilterKey.innerHTML = '<option value="">Filter by: None</option>';
+  const dataFilterOptions = ['tracking', 'item', 'sku', 'dest', 'category', 'carrier', 'priority'];
+  dataFilterOptions.forEach(fieldKey => {
+    const opt = document.createElement('option');
+    opt.value = fieldKey;
+    opt.textContent = FIELD_FILTER_LABELS[fieldKey] || fieldKey;
+    dataFieldFilterKey.appendChild(opt);
+  });
+  dataFieldFilterKey.value = selectedFieldFilterKey;
+
+  // Populate data field filter value selector
+  refreshDataFieldFilterValues();
 
   searchInput.addEventListener('input', e => {
     searchVal = e.target.value;
     applyFilters();
   });
-  fieldFilterKeySel.addEventListener('change', e => {
+  qrFieldSelect.addEventListener('change', e => {
+    qrFieldSelection = e.target.value;
+    clearQRObserver();
+    renderPage();
+  });
+  dataFieldFilterKey.addEventListener('change', e => {
     selectedFieldFilterKey = e.target.value;
     selectedFieldFilterValue = '';
-    refreshFieldFilterControls();
+    refreshDataFieldFilterValues();
     applyFilters();
   });
-  fieldFilterValueSel.addEventListener('change', e => {
+  dataFieldFilterValue.addEventListener('change', e => {
     selectedFieldFilterValue = e.target.value;
-    applyFilters();
-  });
-  filtersContainer.addEventListener('click', e => {
-    const b = e.target.closest('.filter-btn');
-    if (!b) return;
-    document.querySelectorAll('.filter-btn').forEach(x => x.classList.remove('active'));
-    b.classList.add('active');
-    activeFilter = b.dataset.filter;
     applyFilters();
   });
   document.getElementById('btn-remap')?.addEventListener('click', () => goStep(2));
@@ -572,41 +584,45 @@ function launch(records, options = {}) {
   persistView();
 }
 
-function buildStats() {
-  const counts = { transit: 0, delivered: 0, pending: 0, hold: 0 };
-  allRecords.forEach(r => {
-    if (counts[r.status] !== undefined) counts[r.status] += 1;
-  });
-  const defs = [
-    { label: 'Total', key: 'all', color: '#dce8f0' },
-    { label: 'Transit', key: 'transit', color: COLORS.transit },
-    { label: 'Delivered', key: 'delivered', color: COLORS.delivered },
-    { label: 'Pending', key: 'pending', color: COLORS.pending },
-    { label: 'On Hold', key: 'hold', color: COLORS.hold },
-  ];
-  document.getElementById('stats-row').innerHTML = defs.map(d => `
-    <div class="stat-cell">
-      <div class="stat-dot" style="background:${d.color}"></div>
-      <div>
-        <div class="stat-num" style="color:${d.color}">${d.key === 'all' ? allRecords.length : counts[d.key]}</div>
-        <div class="stat-lbl">${d.label}</div>
-      </div>
-    </div>`).join('');
-}
-
 function applyFilters() {
   const q = searchVal.trim().toLowerCase();
   filtered = allRecords.filter(r => {
-    const matchesStatus = activeFilter === 'all' || r.status === activeFilter;
     const matchesQuery = !q || SEARCH_FIELDS.some(k => hasValue(r[k]) && String(r[k]).toLowerCase().includes(q));
-    const matchesField = !selectedFieldFilterKey
+    const matchesDataFilter = !selectedFieldFilterKey
       || !selectedFieldFilterValue
       || String(r[selectedFieldFilterKey] ?? '') === selectedFieldFilterValue;
-    return matchesStatus && matchesQuery && matchesField;
+    return matchesQuery && matchesDataFilter;
   });
   currentPage = 1;
   renderPage();
   persistView();
+}
+
+function refreshDataFieldFilterValues() {
+  const dataFieldFilterValue = document.getElementById('data-field-filter-value');
+  if (!dataFieldFilterValue) return;
+  
+  dataFieldFilterValue.innerHTML = '<option value="">Value: All</option>';
+  if (!selectedFieldFilterKey) {
+    dataFieldFilterValue.disabled = true;
+    return;
+  }
+  
+  const values = new Set();
+  allRecords.forEach(r => {
+    const val = r[selectedFieldFilterKey];
+    if (hasValue(val) && val !== '—') values.add(String(val));
+  });
+  
+  Array.from(values).sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })).forEach(v => {
+    const opt = document.createElement('option');
+    opt.value = v;
+    opt.textContent = v;
+    dataFieldFilterValue.appendChild(opt);
+  });
+  
+  dataFieldFilterValue.value = selectedFieldFilterValue;
+  dataFieldFilterValue.disabled = false;
 }
 
 function renderPage() {
@@ -669,7 +685,8 @@ function renderPage() {
     const renderQR = () => {
       box.innerHTML = '';
       const wrap = document.createElement('div');
-      new QRCode(wrap, { text: r.tracking, width: 148, height: 148, colorDark: '#000', colorLight: '#fff', correctLevel: QRCode.CorrectLevel.M });
+      const qrData = String(r[qrFieldSelection] || r.tracking);
+      new QRCode(wrap, { text: qrData, width: 148, height: 148, colorDark: '#000', colorLight: '#fff', correctLevel: QRCode.CorrectLevel.M });
       box.appendChild(wrap);
       const c3 = document.createElement('div');
       c3.className = 'c3';
